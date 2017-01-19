@@ -502,29 +502,71 @@ AUTH_PARAM_MAPPING = {
 
 
 @contextmanager
-def stdout_redirector(path_name):
-    old_stdout = sys.stdout  
-    fd = open(path_name, 'w')
-    sys.stdout = fd
+def stdouterr_redirector(path_name, err_path_name):
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    out_fd = open(path_name, 'w')
+    err_fd = open(err_path_name, 'w')
+    sys.stdout = out_fd
+    sys.stderr = err_fd
     try:
         yield
     finally:
         sys.stdout = old_stdout    
+        sys.stderr = old_stderr
 
-def get_stdout(path_name):
-    full_stdout = ''
-    last_line = '' 
+def make_redirection_tempfiles():
+    _, ofd_name = tempfile.mkstemp(prefix="ansible")
+    _, efd_name = tempfile.mkstemp(prefix="ansible")
+    return (ofd_name, efd_name)
+
+def cleanup_redirection_tempfiles(redir_names):
+    get_redirected_output(redir_names[0])
+    get_redirected_output(redir_names[1])
+
+def get_redirected_output(path_name):
+    output = []
     with open(path_name, 'r') as fd:
         for line in fd:
             # strip terminal format/color chars
             new_line = re.sub(r'\x1b\[.+m', '', line.encode('ascii'))
-            full_stdout += new_line
-            if new_line.strip():
-               # Assuming last line contains the error message 
-               last_line = new_line.strip().encode('utf-8')
+            output.append(new_line)
     fd.close()
     os.remove(path_name)
-    return full_stdout, last_line
+    return output
+
+def attempt_extract_errors(exc_str, stdout, stderr):
+    errors = [l.strip() for l in stderr if l.strip().startswith('ERROR:')]
+    errors.extend([l.strip() for l in stdout if l.strip().startswith('ERROR:')])
+
+    warnings = [l.strip() for l in stderr if l.strip().startswith('WARNING:')]
+    warnings.extend([l.strip() for l in stdout if l.strip().startswith('WARNING:')])
+
+    # assume either the exception body (if present) or the last warning was the 'most'
+    # fatal.
+
+    if exc_str.strip():
+        msg = exc_str.strip()
+    elif errors:
+        msg = errors[-1].encode('utf-8')
+    else:
+        msg = 'unknown cause'
+
+    return {
+        'warnings': [w.encode('utf-8') for w in warnings],
+        'errors': [e.encode('utf-8') for e in errors],
+        'msg': msg,
+        'module_stderr': ''.join(stderr),
+        'module_stdout': ''.join(stdout)
+    }
+
+def get_failure_info(exc, redir_names, msg_format='%s'):
+    stdout = get_redirected_output(redir_names[0])
+    stderr = get_redirected_output(redir_names[1])
+    reason = attempt_extract_errors(str(exc), stdout, stderr)
+    reason['msg'] = msg_format % reason['msg']
+    return reason
+
 
 class ContainerManager(DockerBaseClass):
 
@@ -690,9 +732,9 @@ class ContainerManager(DockerBaseClass):
                     result['actions'].append(result_action)
 
         if not self.check_mode and result['changed']:
-            _, fd_name = tempfile.mkstemp(prefix="ansible")
+            redir_names = make_redirection_tempfiles()
             try:
-                with stdout_redirector(fd_name):
+                with stdouterr_redirector(*redir_names):
                     do_build = build_action_from_opts(up_options)
                     self.log('Setting do_build to %s' % do_build)
                     self.project.up(
@@ -704,11 +746,11 @@ class ContainerManager(DockerBaseClass):
                         remove_orphans=self.remove_orphans,
                         timeout=self.timeout)
             except Exception as exc:
-                full_stdout, last_line= get_stdout(fd_name)
-                self.client.module.fail_json(msg="Error starting project %s" % str(exc), module_stderr=last_line,
-                                             module_stdout=full_stdout)
+                fail_reason = get_failure_info(exc, redir_names,
+                                               msg_format="Error starting project %s")
+                self.client.module.fail_json(**fail_reason)
             else:
-                get_stdout(fd_name)
+                cleanup_redirection_tempfiles(redir_names)
 
         if self.stopped:
             stop_output = self.cmd_stop(service_names)
@@ -911,16 +953,16 @@ class ContainerManager(DockerBaseClass):
                     ))
                 result['actions'].append(service_res)
         if not self.check_mode and result['changed']:
-            _, fd_name = tempfile.mkstemp(prefix="ansible")
+            redir_names = make_redirection_tempfiles()
             try:
-                with stdout_redirector(fd_name):
+                with stdouterr_redirector(*redir_names):
                     self.project.stop(service_names=service_names, timeout=self.timeout)
             except Exception as exc:
-                full_stdout, last_line = get_stdout(fd_name)
-                self.client.module.fail_json(msg="Error stopping project %s" % str(exc), module_stderr=last_line,
-                                             module_stdout=full_stdout)
+                fail_reason = get_failure_info(exc, redir_names,
+                                               msg_format="Error stopping project %s")
+                self.client.module.fail_json(**fail_reason)
             else:
-                get_stdout(fd_name)
+                cleanup_redirection_tempfiles(redir_names)
         return result
 
     def cmd_restart(self, service_names):
@@ -945,16 +987,16 @@ class ContainerManager(DockerBaseClass):
                 result['actions'].append(service_res)
          
         if not self.check_mode and result['changed']:
-            _, fd_name = tempfile.mkstemp(prefix="ansible")
+            redir_names = make_redirection_tempfiles()
             try:
-                with stdout_redirector(fd_name):
+                with stdouterr_redirector(*redir_names):
                     self.project.restart(service_names=service_names, timeout=self.timeout)
             except Exception as exc:
-                full_stdout, last_line = get_stdout(fd_name)
-                self.client.module.fail_json(msg="Error restarting project %s" % str(exc), module_stderr=last_line,
-                                             module_stdout=full_stdout)
+                fail_reason = get_failure_info(exc, redir_names,
+                                               msg_format="Error restarting project %s")
+                self.client.module.fail_json(**fail_reason)
             else:
-                get_stdout(fd_name)
+                cleanup_redirection_tempfiles(redir_names)
         return result
 
     def cmd_scale(self):
