@@ -502,27 +502,33 @@ AUTH_PARAM_MAPPING = {
 
 
 @contextmanager
-def stdouterr_redirector(path_name, err_path_name):
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
-    out_fd = open(path_name, 'w')
-    err_fd = open(err_path_name, 'w')
-    sys.stdout = out_fd
-    sys.stderr = err_fd
+def stdout_redirector(path_name):
+    old_fh = sys.stdout
+    fd = open(path_name, 'w')
+    sys.stdout = fd
     try:
         yield
     finally:
-        sys.stdout = old_stdout    
-        sys.stderr = old_stderr
+        sys.stdout = old_fh
+
+@contextmanager
+def stderr_redirector(path_name):
+    old_fh = sys.stderr
+    fd = open(path_name, 'w')
+    sys.stderr = fd
+    try:
+        yield
+    finally:
+        sys.stderr = old_fh
 
 def make_redirection_tempfiles():
-    _, ofd_name = tempfile.mkstemp(prefix="ansible")
-    _, efd_name = tempfile.mkstemp(prefix="ansible")
+    _, out_redir_name = tempfile.mkstemp(prefix="ansible")    
+    _, err_redir_name = tempfile.mkstemp(prefix="ansible")
     return (ofd_name, efd_name)
 
-def cleanup_redirection_tempfiles(redir_names):
-    get_redirected_output(redir_names[0])
-    get_redirected_output(redir_names[1])
+def cleanup_redirection_tempfiles(out_name, err_name):
+    get_redirected_output(out_name)
+    get_redirected_output(err_name)
 
 def get_redirected_output(path_name):
     output = []
@@ -560,9 +566,13 @@ def attempt_extract_errors(exc_str, stdout, stderr):
         'module_stdout': ''.join(stdout)
     }
 
-def get_failure_info(exc, redir_names, msg_format='%s'):
-    stdout = get_redirected_output(redir_names[0])
-    stderr = get_redirected_output(redir_names[1])
+def get_failure_info(exc, out_name, err_name=None, msg_format='%s'):
+    if err_name is None:
+        stderr = []
+    else:
+        stderr = get_redirected_output(err_name)
+    stdout = get_redirected_output(out_name)
+
     reason = attempt_extract_errors(str(exc), stdout, stderr)
     reason['msg'] = msg_format % reason['msg']
     return reason
@@ -681,7 +691,7 @@ class ContainerManager(DockerBaseClass):
         return options
 
     def cmd_up(self):
-    
+
         start_deps = self.dependencies
         service_names = self.services
         detached = True
@@ -708,12 +718,12 @@ class ContainerManager(DockerBaseClass):
 
         if self.pull:
             pull_output = self.cmd_pull()
-            result['changed'] = pull_output['changed']  
+            result['changed'] = pull_output['changed']
             result['actions'] += pull_output['actions']
 
         if self.build:
             build_output = self.cmd_build()
-            result['changed'] = build_output['changed']  
+            result['changed'] = build_output['changed']
             result['actions'] += build_output['actions']
 
         for service in self.project.services:
@@ -721,8 +731,8 @@ class ContainerManager(DockerBaseClass):
                 plan = service.convergence_plan(strategy=converge)
                 if plan.action != 'noop':
                     result['changed'] = True
-                    result_action = dict(service=service.name) 
-                    result_action[plan.action] = []                      
+                    result_action = dict(service=service.name)
+                    result_action[plan.action] = []
                     for container in plan.containers:
                         result_action[plan.action].append(dict(
                             id=container.id,
@@ -732,39 +742,40 @@ class ContainerManager(DockerBaseClass):
                     result['actions'].append(result_action)
 
         if not self.check_mode and result['changed']:
-            redir_names = make_redirection_tempfiles()
+            out_redir_name, err_redir_name = make_redirection_tempfiles()
             try:
-                with stdouterr_redirector(*redir_names):
-                    do_build = build_action_from_opts(up_options)
-                    self.log('Setting do_build to %s' % do_build)
-                    self.project.up(
-                        service_names=service_names,
-                        start_deps=start_deps,
-                        strategy=converge,
-                        do_build=do_build,
-                        detached=detached,
-                        remove_orphans=self.remove_orphans,
-                        timeout=self.timeout)
+                with stdout_redirector(out_redir_name):
+                    with stderr_redirector(err_redir_name):
+                        do_build = build_action_from_opts(up_options)
+                        self.log('Setting do_build to %s' % do_build)
+                        self.project.up(
+                            service_names=service_names,
+                            start_deps=start_deps,
+                            strategy=converge,
+                            do_build=do_build,
+                            detached=detached,
+                            remove_orphans=self.remove_orphans,
+                            timeout=self.timeout)
             except Exception as exc:
-                fail_reason = get_failure_info(exc, redir_names,
+                fail_reason = get_failure_info(exc, out_redir_name, err_redir_name,
                                                msg_format="Error starting project %s")
                 self.client.module.fail_json(**fail_reason)
             else:
-                cleanup_redirection_tempfiles(redir_names)
+                cleanup_redirection_tempfiles(out_redir_name, err_redir_name)
 
         if self.stopped:
             stop_output = self.cmd_stop(service_names)
-            result['changed'] = stop_output['changed']  
+            result['changed'] = stop_output['changed']
             result['actions'] += stop_output['actions']
 
         if self.restarted:
             restart_output = self.cmd_restart(service_names)
-            result['changed'] = restart_output['changed']  
+            result['changed'] = restart_output['changed']
             result['actions'] += restart_output['actions']
 
         if self.scale:
             scale_output = self.cmd_scale()
-            result['changed'] = scale_output['changed']  
+            result['changed'] = scale_output['changed']
             result['actions'] += scale_output['actions']
 
         for service in self.project.services:
@@ -833,7 +844,7 @@ class ContainerManager(DockerBaseClass):
         if not self.check_mode:
             for service in self.project.get_services(self.services, include_deps=False):
                 if 'image' not in service.options:
-                    continue 
+                    continue
 
                 self.log('Pulling image for service %s' % service.name)
                 # store the existing image ID
@@ -851,16 +862,16 @@ class ContainerManager(DockerBaseClass):
                 try:
                     service.pull(ignore_pull_failures=False)
                 except Exception as exc:
-                    self.client.fail("Error: pull failed with %s" % str(exc)) 
+                    self.client.fail("Error: pull failed with %s" % str(exc))
 
                 # store the new image ID
-                new_image_id = '' 
+                new_image_id = ''
                 try:
                     image = service.image()
                     if image and image.get('Id'):
                         new_image_id = image['Id']
                 except NoSuchImageError as exc:
-                    self.client.fail("Error: service image lookup failed after pull - %s" % str(exc))    
+                    self.client.fail("Error: service image lookup failed after pull - %s" % str(exc))
 
                 if new_image_id != old_image_id:
                     # if a new image was pulled
@@ -898,13 +909,13 @@ class ContainerManager(DockerBaseClass):
                     try:
                         new_image_id = service.build(pull=True, no_cache=self.nocache)
                     except Exception as exc:
-                        self.client.fail("Error: build failed with %s" % str(exc)) 
+                        self.client.fail("Error: build failed with %s" % str(exc))
 
                     if new_image_id not in old_image_id:
                         # if a new image was built
                         result['changed'] = True
                         result['actions'].append(dict(
-                            service=service.name, 
+                            service=service.name,
                             built_image=dict(
                                 name=service.image_name,
                                 id=new_image_id
@@ -943,7 +954,7 @@ class ContainerManager(DockerBaseClass):
                 service_res = dict(
                     service=service.name,
                     stop=[]
-                ) 
+                )
                 for container in service.containers(stopped=False):
                     result['changed'] = True
                     service_res['stop'].append(dict(
@@ -953,16 +964,17 @@ class ContainerManager(DockerBaseClass):
                     ))
                 result['actions'].append(service_res)
         if not self.check_mode and result['changed']:
-            redir_names = make_redirection_tempfiles()
+            out_redir_name, err_redir_name = make_redirection_tempfiles()
             try:
-                with stdouterr_redirector(*redir_names):
-                    self.project.stop(service_names=service_names, timeout=self.timeout)
+                with stdout_redirector(out_redir_name):
+                    with stderr_redirector(err_redir_name):
+                        self.project.stop(service_names=service_names, timeout=self.timeout)
             except Exception as exc:
-                fail_reason = get_failure_info(exc, redir_names,
+                fail_reason = get_failure_info(exc, out_redir_name, err_redir_name,
                                                msg_format="Error stopping project %s")
                 self.client.module.fail_json(**fail_reason)
             else:
-                cleanup_redirection_tempfiles(redir_names)
+                cleanup_redirection_tempfiles(out_redir_name, err_redir_name)
         return result
 
     def cmd_restart(self, service_names):
@@ -985,18 +997,19 @@ class ContainerManager(DockerBaseClass):
                         short_id=container.short_id
                     ))
                 result['actions'].append(service_res)
-         
+
         if not self.check_mode and result['changed']:
-            redir_names = make_redirection_tempfiles()
+            out_redir_name, err_redir_name = make_redirection_tempfiles()
             try:
-                with stdouterr_redirector(*redir_names):
-                    self.project.restart(service_names=service_names, timeout=self.timeout)
+                with stdout_redirector(out_redir_name):
+                    with stderr_redirector(err_redir_name):
+                        self.project.restart(service_names=service_names, timeout=self.timeout)
             except Exception as exc:
-                fail_reason = get_failure_info(exc, redir_names,
+                fail_reason = get_failure_info(exc, out_redir_name, err_redir_name,
                                                msg_format="Error restarting project %s")
                 self.client.module.fail_json(**fail_reason)
             else:
-                cleanup_redirection_tempfiles(redir_names)
+                cleanup_redirection_tempfiles(out_redir_name, err_redir_name)
         return result
 
     def cmd_scale(self):
@@ -1019,7 +1032,7 @@ class ContainerManager(DockerBaseClass):
                             service.scale(int(self.scale[service.name]))
                         except Exception as exc:
                             self.client.fail("Error scaling %s - %s" % (service.name, str(exc)))
-                    result['actions'].append(service_res) 
+                    result['actions'].append(service_res)
         return result
 
 
