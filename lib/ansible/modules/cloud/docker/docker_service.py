@@ -502,27 +502,33 @@ AUTH_PARAM_MAPPING = {
 
 
 @contextmanager
-def stdouterr_redirector(path_name, err_path_name):
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
-    out_fd = open(path_name, 'w')
-    err_fd = open(err_path_name, 'w')
-    sys.stdout = out_fd
-    sys.stderr = err_fd
+def stdout_redirector(path_name):
+    old_stdout = sys.stdout  
+    fd = open(path_name, 'w')
+    sys.stdout = fd
     try:
         yield
     finally:
         sys.stdout = old_stdout    
-        sys.stderr = old_stderr
+
+@contextmanager
+def stderr_redirector(path_name):
+    old_fh = sys.stderr
+    fd = open(path_name, 'w')
+    sys.stderr = fd
+    try:
+        yield
+    finally:
+        sys.stderr = old_fh
 
 def make_redirection_tempfiles():
-    _, ofd_name = tempfile.mkstemp(prefix="ansible")
-    _, efd_name = tempfile.mkstemp(prefix="ansible")
-    return (ofd_name, efd_name)
+    _, out_redir_name = tempfile.mkstemp(prefix="ansible")    
+    _, err_redir_name = tempfile.mkstemp(prefix="ansible")
+    return (out_redir_name, err_redir_name)
 
-def cleanup_redirection_tempfiles(redir_names):
-    get_redirected_output(redir_names[0])
-    get_redirected_output(redir_names[1])
+def cleanup_redirection_tempfiles(out_name, err_name):
+    get_redirected_output(out_name)
+    get_redirected_output(err_name)
 
 def get_redirected_output(path_name):
     output = []
@@ -560,9 +566,13 @@ def attempt_extract_errors(exc_str, stdout, stderr):
         'module_stdout': ''.join(stdout)
     }
 
-def get_failure_info(exc, redir_names, msg_format='%s'):
-    stdout = get_redirected_output(redir_names[0])
-    stderr = get_redirected_output(redir_names[1])
+def get_failure_info(exc, out_name, err_name=None, msg_format='%s'):
+    if err_name is None:
+        stderr = []
+    else:
+        stderr = get_redirected_output(err_name)
+    stdout = get_redirected_output(out_name)
+
     reason = attempt_extract_errors(str(exc), stdout, stderr)
     reason['msg'] = msg_format % reason['msg']
     return reason
@@ -732,25 +742,26 @@ class ContainerManager(DockerBaseClass):
                     result['actions'].append(result_action)
 
         if not self.check_mode and result['changed']:
-            redir_names = make_redirection_tempfiles()
+            out_redir_name, err_redir_name = make_redirection_tempfiles()
             try:
-                with stdouterr_redirector(*redir_names):
-                    do_build = build_action_from_opts(up_options)
-                    self.log('Setting do_build to %s' % do_build)
-                    self.project.up(
-                        service_names=service_names,
-                        start_deps=start_deps,
-                        strategy=converge,
-                        do_build=do_build,
-                        detached=detached,
-                        remove_orphans=self.remove_orphans,
-                        timeout=self.timeout)
+                with stdout_redirector(out_redir_name):
+                    with stderr_redirector(err_redir_name):
+                        do_build = build_action_from_opts(up_options)
+                        self.log('Setting do_build to %s' % do_build)
+                        self.project.up(
+                            service_names=service_names,
+                            start_deps=start_deps,
+                            strategy=converge,
+                            do_build=do_build,
+                            detached=detached,
+                            remove_orphans=self.remove_orphans,
+                            timeout=self.timeout)
             except Exception as exc:
-                fail_reason = get_failure_info(exc, redir_names,
+                fail_reason = get_failure_info(exc, out_redir_name, err_redir_name,
                                                msg_format="Error starting project %s")
                 self.client.module.fail_json(**fail_reason)
             else:
-                cleanup_redirection_tempfiles(redir_names)
+                cleanup_redirection_tempfiles(out_redir_name, err_redir_name)
 
         if self.stopped:
             stop_output = self.cmd_stop(service_names)
@@ -953,16 +964,17 @@ class ContainerManager(DockerBaseClass):
                     ))
                 result['actions'].append(service_res)
         if not self.check_mode and result['changed']:
-            redir_names = make_redirection_tempfiles()
+            out_redir_name, err_redir_name = make_redirection_tempfiles()
             try:
-                with stdouterr_redirector(*redir_names):
-                    self.project.stop(service_names=service_names, timeout=self.timeout)
+                with stdout_redirector(out_redir_name):
+                    with stderr_redirector(err_redir_name):
+                        self.project.stop(service_names=service_names, timeout=self.timeout)
             except Exception as exc:
-                fail_reason = get_failure_info(exc, redir_names,
+                fail_reason = get_failure_info(exc, out_redir_name, err_redir_name,
                                                msg_format="Error stopping project %s")
                 self.client.module.fail_json(**fail_reason)
             else:
-                cleanup_redirection_tempfiles(redir_names)
+                cleanup_redirection_tempfiles(out_redir_name, err_redir_name)
         return result
 
     def cmd_restart(self, service_names):
@@ -987,16 +999,17 @@ class ContainerManager(DockerBaseClass):
                 result['actions'].append(service_res)
          
         if not self.check_mode and result['changed']:
-            redir_names = make_redirection_tempfiles()
+            out_redir_name, err_redir_name = make_redirection_tempfiles()
             try:
-                with stdouterr_redirector(*redir_names):
-                    self.project.restart(service_names=service_names, timeout=self.timeout)
+                with stdout_redirector(out_redir_name):
+                    with stderr_redirector(err_redir_name):
+                        self.project.restart(service_names=service_names, timeout=self.timeout)
             except Exception as exc:
-                fail_reason = get_failure_info(exc, redir_names,
+                fail_reason = get_failure_info(exc, out_redir_name, err_redir_name,
                                                msg_format="Error restarting project %s")
                 self.client.module.fail_json(**fail_reason)
             else:
-                cleanup_redirection_tempfiles(redir_names)
+                cleanup_redirection_tempfiles(out_redir_name, err_redir_name)
         return result
 
     def cmd_scale(self):
